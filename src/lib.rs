@@ -77,8 +77,8 @@ impl Future for MitmResponseFuture {
             Async::Ready(response) => {
                 info!("MitmResponseFuture::poll() response={:?}", response);
                 let (parts, body) = response.into_parts();
-                let snoopy_body: MitmBody = MitmBody {inner: body};
-                let new_response: Response<MitmBody> = Response::from_parts(parts, snoopy_body);
+                let mitm_body: MitmBody = MitmBody {inner: body};
+                let new_response: Response<MitmBody> = Response::from_parts(parts, mitm_body);
                 info!("MitmResponseFuture::poll() new_response={:?}", new_response);
                 Ok(Async::Ready(new_response))
             },
@@ -124,8 +124,8 @@ impl ProxyService {
             uri_parts.scheme = Some(Scheme::HTTPS);
             req_parts.uri = Uri::from_parts(uri_parts).unwrap();
         }
-        let snoopy_req_body = MitmBody {inner: body};
-        let out_req: Request<MitmBody> = Request::from_parts(req_parts, snoopy_req_body);
+        let mitm_req_body = MitmBody {inner: body};
+        let out_req: Request<MitmBody> = Request::from_parts(req_parts, mitm_req_body);
         info!("ProxyService::proxy_request() making request: {:?}", out_req);
         let res_fut: ResponseFuture = CLIENT.request(out_req);
         let result: MitmResponseFuture = MitmResponseFuture {inner: res_fut};
