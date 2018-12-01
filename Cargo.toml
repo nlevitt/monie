@@ -1,0 +1,24 @@
+[package]
+name = "mitmprox"
+version = "0.1.0"
+authors = ["Noah Levitt <nlevitt@archive.org>"]
+
+[dependencies]
+hyper = "0.12.16"
+futures = "0.1.25"
+http = "0.1.13"
+log = "0.4.5"
+env_logger = "0.5.13"
+hyper-rustls = "0.15.0"
+rustls = "0.14"
+tokio-rustls = "0.8.0"
+tokio = "0.1.11"
+lazy_static = "1.2.0"
+bytes = "0.4"
+openssl = "0.10"
+lru-cache = "0.1"
+
+# [replace]
+# "hyper:0.12.16" = { path = '../hyper' }
+# "hyper-rustls:0.15.0" = { path = '../hyper-rustls' }
+# "tokio-rustls:0.8.0" = { path = '../tokio-rustls' }
