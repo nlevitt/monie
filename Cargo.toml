@@ -18,7 +18,7 @@ bytes = "0.4"
 openssl = "0.10"
 lru-cache = "0.1"
 
-# [replace]
-# "hyper:0.12.16" = { path = '../hyper' }
+[replace]
+"hyper:0.12.18" = { path = '../hyper' }
 # "hyper-rustls:0.15.0" = { path = '../hyper-rustls' }
 # "tokio-rustls:0.8.0" = { path = '../tokio-rustls' }
