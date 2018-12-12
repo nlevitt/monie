@@ -68,6 +68,16 @@ impl Payload for MitmBody {
     }
 }
 
+// noah__ 10:07 in a hyper server implementation, how would you hook in to do something at the end  of each request, for example to write an access log line?
+// seanmonstar (IRC)Mozilla IRC Network (+mozilla:matrix.org) noah__: end as in after the response body finished?
+// noah__ yeah exactly
+// seanmonstar (IRC)Mozilla IRC Network (+mozilla:matrix.org) you could provide a body that has a Drop impl
+impl Drop for MitmBody {
+    fn drop(&mut self) {
+        info!("MitmBody::drop()");
+    }
+}
+
 impl Future for MitmResponseFuture {
     type Item = Response<MitmBody>;
     type Error = hyper::error::Error;
@@ -100,12 +110,8 @@ impl ProxyService {
             TlsAcceptor::from(tls_cfg).accept(upgraded)
         }).map(|stream: TlsStream<Upgraded, rustls::ServerSession>| {
             let inner_service = ProxyService{authority: Some(authority)};
-            let conn = HTTP
-                .serve_connection(stream, inner_service)
-                .then(|z| {
-                    info!("access log here for https requests? nope, may have handled more than one");
-                    z
-                }).map_err(|err: hyper::Error| {
+            let conn = HTTP.serve_connection(stream, inner_service)
+                .map_err(|err: hyper::Error| {
                     error!("ProxyService::connect() serve_connection error: {:?}", err);
                 });
             hyper::rt::spawn(conn);
@@ -133,10 +139,6 @@ impl ProxyService {
         info!("ProxyService::proxy_request() making request: {:?}", out_req);
         let res_fut: ResponseFuture = CLIENT.request(out_req);
         let result: MitmResponseFuture = MitmResponseFuture {inner: res_fut};
-        let result = result.then(|x| {
-            info!("finished handling the request? nope, not really");
-            x
-        });
         Box::new(result)
     }
 }
