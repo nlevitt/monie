@@ -40,12 +40,14 @@ pub struct ProxyService {
 
 #[derive(Debug)]
 pub struct MitmResponseFuture {
-    inner: ResponseFuture
+    inner: ResponseFuture,
+    uri: Uri,
 }
 
 #[derive(Debug)]
 pub struct MitmBody {
-    inner: Body
+    inner: Body,
+    uri: Uri,
 }
 
 impl Payload for MitmBody {
@@ -74,7 +76,7 @@ impl Payload for MitmBody {
 // seanmonstar (IRC)Mozilla IRC Network (+mozilla:matrix.org) you could provide a body that has a Drop impl
 impl Drop for MitmBody {
     fn drop(&mut self) {
-        info!("MitmBody::drop()");
+        info!("MitmBody::drop() self.uri={:?}", self.uri);
     }
 }
 
@@ -85,9 +87,9 @@ impl Future for MitmResponseFuture {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.inner.poll()? {
             Async::Ready(response) => {
-                info!("MitmResponseFuture::poll() response={:?}", response);
+                info!("MitmResponseFuture::poll() uri={:?} response={:?}", self.uri, response);
                 let (parts, body) = response.into_parts();
-                let mitm_body: MitmBody = MitmBody {inner: body};
+                let mitm_body: MitmBody = MitmBody {inner: body, uri: self.uri.clone()};
                 let new_response: Response<MitmBody> = Response::from_parts(parts, mitm_body);
                 info!("MitmResponseFuture::poll() new_response={:?}", new_response);
                 Ok(Async::Ready(new_response))
@@ -103,6 +105,7 @@ impl ProxyService {
         info!("ProxyService::connect() impersonating {:?}", authority);
         let tls_cfg = tls_config(&authority);
 
+        let uri = in_req.uri().clone();
         let upgrade = in_req.into_body().on_upgrade().map_err(|e| {
             info!("ProxyService::connect() on_upgrade error: {:?}", e);
             io::Error::new(io::ErrorKind::Other, e)
@@ -122,7 +125,15 @@ impl ProxyService {
         hyper::rt::spawn(upgrade);
 
         // XXX should really establish connection to remote site before responding with 200
-        Box::new(future::ok(Response::builder().status(200).body(MitmBody{inner: Body::empty()}).unwrap()))
+        Box::new(
+            future::ok(
+                Response::builder().status(200).body(
+                    MitmBody {
+                        inner: Body::empty(),
+                        uri: uri,
+                    }).unwrap()
+            )
+        )
     }
 
     pub fn proxy_request(&mut self, in_req: Request<Body>) ->
@@ -134,11 +145,16 @@ impl ProxyService {
             uri_parts.scheme = Some(Scheme::HTTPS);
             req_parts.uri = Uri::from_parts(uri_parts).unwrap();
         }
-        let mitm_req_body = MitmBody {inner: body};
-        let out_req: Request<MitmBody> = Request::from_parts(req_parts, mitm_req_body);
+        let mitm_req_body = MitmBody {inner: body, uri: req_parts.uri.clone()};
+        let out_req = Request::from_parts(req_parts, mitm_req_body);
         info!("ProxyService::proxy_request() making request: {:?}", out_req);
+
+        let uri = out_req.uri().clone();
         let res_fut: ResponseFuture = CLIENT.request(out_req);
-        let result: MitmResponseFuture = MitmResponseFuture {inner: res_fut};
+        let result: MitmResponseFuture = MitmResponseFuture {
+            inner: res_fut,
+            uri: uri
+        };
         Box::new(result)
     }
 }
