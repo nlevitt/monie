@@ -11,6 +11,7 @@ extern crate openssl;
 extern crate lru_cache;
 
 use std::io;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -50,6 +51,11 @@ pub struct MitmBody {
     uri: Uri,
 }
 
+#[derive(Debug)]
+pub struct MitmResponseBody {
+    inner: MitmBody
+}
+
 impl Payload for MitmBody {
     type Data = Chunk;
     type Error = hyper::error::Error;
@@ -70,18 +76,39 @@ impl Payload for MitmBody {
     }
 }
 
-// noah__ 10:07 in a hyper server implementation, how would you hook in to do something at the end  of each request, for example to write an access log line?
-// seanmonstar (IRC)Mozilla IRC Network (+mozilla:matrix.org) noah__: end as in after the response body finished?
-// noah__ yeah exactly
-// seanmonstar (IRC)Mozilla IRC Network (+mozilla:matrix.org) you could provide a body that has a Drop impl
-impl Drop for MitmBody {
+impl Payload for MitmResponseBody {
+    type Data = Chunk;
+    type Error = hyper::error::Error;
+
+    fn poll_data(&mut self) -> Poll<Option<Self::Data>, Self::Error> {
+        self.inner.poll_data()
+    }
+}
+
+impl Deref for MitmResponseBody {
+    type Target = MitmBody;
+    fn deref(&self) -> &MitmBody {
+        &self.inner
+    }
+}
+
+
+/*
+ * <noah__> in a hyper server implementation, how would you hook in to do
+ *          something at the end  of each request, for example to write an
+ *          access log line?
+ * <seanmonstar> noah__: end as in after the response body finished?
+ * <noah__> yeah exactly
+ * <seanmonstar> you could provide a body that has a Drop impl
+ */
+impl Drop for MitmResponseBody {
     fn drop(&mut self) {
-        info!("MitmBody::drop() self.uri={:?}", self.uri);
+        info!("MitmResponseBody::drop() self.uri={:?}", self.uri);
     }
 }
 
 impl Future for MitmResponseFuture {
-    type Item = Response<MitmBody>;
+    type Item = Response<MitmResponseBody>;
     type Error = hyper::error::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -89,8 +116,8 @@ impl Future for MitmResponseFuture {
             Async::Ready(response) => {
                 info!("MitmResponseFuture::poll() uri={:?} response={:?}", self.uri, response);
                 let (parts, body) = response.into_parts();
-                let mitm_body: MitmBody = MitmBody {inner: body, uri: self.uri.clone()};
-                let new_response: Response<MitmBody> = Response::from_parts(parts, mitm_body);
+                let mitm_body: MitmResponseBody = MitmResponseBody { inner: MitmBody {inner: body, uri: self.uri.clone()}};
+                let new_response: Response<MitmResponseBody> = Response::from_parts(parts, mitm_body);
                 info!("MitmResponseFuture::poll() new_response={:?}", new_response);
                 Ok(Async::Ready(new_response))
             },
@@ -128,9 +155,11 @@ impl ProxyService {
         Box::new(
             future::ok(
                 Response::builder().status(200).body(
-                    MitmBody {
-                        inner: Body::empty(),
-                        uri: uri,
+                    MitmResponseBody {
+                        inner: MitmBody {
+                            inner: Body::empty(),
+                            uri: uri,
+                        },
                     }).unwrap()
             )
         )
@@ -161,9 +190,9 @@ impl ProxyService {
 
 impl Service for ProxyService {
     type ReqBody = Body;
-    type ResBody = MitmBody;
+    type ResBody = MitmResponseBody;
     type Error = hyper::error::Error;
-    type Future = Box<Future<Item=Response<MitmBody>, Error=hyper::error::Error> + Send>;
+    type Future = Box<Future<Item=Response<MitmResponseBody>, Error=hyper::error::Error> + Send>;
 
     fn call(&mut self, in_req: Request<Body>) -> Self::Future {
         info!("ProxyService::call() handling {:?}", in_req);
@@ -180,7 +209,7 @@ pub struct NewProxyService {}
 
 impl NewService for NewProxyService {
     type ReqBody = Body;
-    type ResBody = MitmBody;
+    type ResBody = MitmResponseBody;
     type Error = hyper::error::Error;
     type Service = ProxyService;
     type InitError = hyper::error::Error;
