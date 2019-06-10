@@ -1,273 +1,300 @@
-extern crate hyper;
-extern crate futures;
-extern crate http;
-#[macro_use] extern crate log;
-extern crate rustls;
-extern crate tokio_rustls;
-extern crate hyper_rustls;
-#[macro_use] extern crate lazy_static;
-extern crate bytes;
-extern crate openssl;
-extern crate lru_cache;
+#![deny(warnings)]
 
-use std::io;
-use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+#[macro_use]
+extern crate lazy_static;
+#[macro_use]
+extern crate log;
+
+pub mod certauth;
+
+use std::error::Error;
+use std::fmt::Display;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::{self, Future, FutureResult};
-use futures::{Async, Poll};
-use http::uri::{Authority, Scheme, Uri};
-use hyper::{Chunk, Request, Method, Response};
-use hyper::body::{Body, Payload};
-use hyper::client::{self, Client, ResponseFuture, HttpConnector};
+use futures::stream::Stream;
+use futures::sync::mpsc;
+use futures::Sink;
+use http::method::Method;
+use http::uri::{Authority, Scheme};
+use hyper::client::pool::Pooled;
+use hyper::client::{ClientError, HttpConnector, PoolClient};
 use hyper::server::conn::Http;
-use hyper::service::{Service, NewService};
+use hyper::service::{service_fn, NewService, Service};
 use hyper::upgrade::Upgraded;
+use hyper::{Body, Chunk, Client, Request, Response};
 use hyper_rustls::HttpsConnector;
-use lru_cache::LruCache;
-use openssl::asn1::Asn1Time;
-use openssl::hash::MessageDigest;
-use openssl::pkey::PKey;
-use openssl::rsa::Rsa;
-use openssl::x509::{X509Builder, X509NameBuilder};
 use tokio_rustls::{Accept, TlsAcceptor, TlsStream};
 
-#[derive(Debug)]
-pub struct ProxyService {
-    // value is set from CONNECT line when applicable and used to construct url
-    authority: Option<Authority>
-}
-
-#[derive(Debug)]
-pub struct MitmResponseFuture {
-    inner: ResponseFuture,
-    uri: Uri,
-}
-
-#[derive(Debug)]
-pub struct MitmBody {
-    inner: Body,
-    uri: Uri,
-}
-
-#[derive(Debug)]
-pub struct MitmResponseBody {
-    inner: MitmBody
-}
-
-impl Payload for MitmBody {
-    type Data = Chunk;
-    type Error = hyper::error::Error;
-
-    fn poll_data(&mut self) -> Poll<Option<Self::Data>, Self::Error> {
-        match self.inner.poll_data()? {
-            Async::Ready(result) => {
-                match result {
-                    Some(chunk) => {
-                        debug!("MitmBody::poll_data() chunk.len()={:?}", chunk.len());
-                        Ok(Async::Ready(Some(chunk)))
-                    },
-                    None => Ok(Async::Ready(None))
-                }
-            },
-            Async::NotReady => Ok(Async::NotReady),
-        }
-    }
-}
-
-impl Payload for MitmResponseBody {
-    type Data = Chunk;
-    type Error = hyper::error::Error;
-
-    fn poll_data(&mut self) -> Poll<Option<Self::Data>, Self::Error> {
-        self.inner.poll_data()
-    }
-}
-
-impl Deref for MitmResponseBody {
-    type Target = MitmBody;
-    fn deref(&self) -> &MitmBody {
-        &self.inner
-    }
-}
-
-
-/*
- * <noah__> in a hyper server implementation, how would you hook in to do
- *          something at the end  of each request, for example to write an
- *          access log line?
- * <seanmonstar> noah__: end as in after the response body finished?
- * <noah__> yeah exactly
- * <seanmonstar> you could provide a body that has a Drop impl
- */
-impl Drop for MitmResponseBody {
-    fn drop(&mut self) {
-        info!("MitmResponseBody::drop() self.uri={:?}", self.uri);
-    }
-}
-
-impl Future for MitmResponseFuture {
-    type Item = Response<MitmResponseBody>;
-    type Error = hyper::error::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.inner.poll()? {
-            Async::Ready(response) => {
-                info!("MitmResponseFuture::poll() uri={:?} response={:?}", self.uri, response);
-                let (parts, body) = response.into_parts();
-                let mitm_body: MitmResponseBody = MitmResponseBody { inner: MitmBody {inner: body, uri: self.uri.clone()}};
-                let new_response: Response<MitmResponseBody> = Response::from_parts(parts, mitm_body);
-                info!("MitmResponseFuture::poll() new_response={:?}", new_response);
-                Ok(Async::Ready(new_response))
-            },
-            Async::NotReady => Ok(Async::NotReady),
-        }
-    }
-}
-
-impl ProxyService {
-    pub fn connect(&self, in_req: Request<Body>) -> <ProxyService as Service>::Future {
-        let authority = Authority::from_shared(Bytes::from(in_req.uri().to_string())).unwrap();
-        info!("ProxyService::connect() impersonating {:?}", authority);
-        let tls_cfg = tls_config(&authority);
-
-        let uri = in_req.uri().clone();
-        let upgrade = in_req.into_body().on_upgrade().map_err(|e| {
-            info!("ProxyService::connect() on_upgrade error: {:?}", e);
-            io::Error::new(io::ErrorKind::Other, e)
-        }).and_then(|upgraded: Upgraded| -> Accept<Upgraded> {
-            TlsAcceptor::from(tls_cfg).accept(upgraded)
-        }).map(|stream: TlsStream<Upgraded, rustls::ServerSession>| {
-            let inner_service = ProxyService{authority: Some(authority)};
-            let conn = HTTP.serve_connection(stream, inner_service)
-                .map_err(|err: hyper::Error| {
-                    error!("ProxyService::connect() serve_connection error: {:?}", err);
-                });
-            hyper::rt::spawn(conn);
-        }).map_err(|err: io::Error| {
-            error!("ProxyService::connect() error from somewhere: {}", err);
-        });
-
-        hyper::rt::spawn(upgrade);
-
-        // XXX should really establish connection to remote site before responding with 200
-        Box::new(
-            future::ok(
-                Response::builder().status(200).body(
-                    MitmResponseBody {
-                        inner: MitmBody {
-                            inner: Body::empty(),
-                            uri: uri,
-                        },
-                    }).unwrap()
-            )
-        )
-    }
-
-    pub fn proxy_request(&mut self, in_req: Request<Body>) ->
-            <ProxyService as Service>::Future {
-        let (mut req_parts, body) = in_req.into_parts();
-        if self.authority.is_some() {
-            let mut uri_parts = req_parts.uri.into_parts();
-            uri_parts.authority = self.authority.clone();
-            uri_parts.scheme = Some(Scheme::HTTPS);
-            req_parts.uri = Uri::from_parts(uri_parts).unwrap();
-        }
-        let mitm_req_body = MitmBody {inner: body, uri: req_parts.uri.clone()};
-        let out_req = Request::from_parts(req_parts, mitm_req_body);
-        info!("ProxyService::proxy_request() making request: {:?}", out_req);
-
-        let uri = out_req.uri().clone();
-        let res_fut: ResponseFuture = CLIENT.request(out_req);
-        let result: MitmResponseFuture = MitmResponseFuture {
-            inner: res_fut,
-            uri: uri
-        };
-        Box::new(result)
-    }
-}
-
-impl Service for ProxyService {
-    type ReqBody = Body;
-    type ResBody = MitmResponseBody;
-    type Error = hyper::error::Error;
-    type Future = Box<Future<Item=Response<MitmResponseBody>, Error=hyper::error::Error> + Send>;
-
-    fn call(&mut self, in_req: Request<Body>) -> Self::Future {
-        info!("ProxyService::call() handling {:?}", in_req);
-        if *in_req.method() == Method::CONNECT {
-            self.connect(in_req)
-        } else {
-            self.proxy_request(in_req)
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct NewProxyService {}
-
-impl NewService for NewProxyService {
-    type ReqBody = Body;
-    type ResBody = MitmResponseBody;
-    type Error = hyper::error::Error;
-    type Service = ProxyService;
-    type InitError = hyper::error::Error;
-    type Future = FutureResult<Self::Service, Self::InitError>;
-
-    fn new_service(&self) -> Self::Future {
-        future::ok(ProxyService{authority: None})
-    }
+pub trait Mitm {
+    fn new() -> Self;
+    fn request_headers(&self, req: Request<Body>) -> Request<Body>;
+    fn request_body_chunk(&self, chunk: Chunk) -> Chunk;
+    fn response_headers(&self, res: Response<Body>) -> Response<Body>;
+    fn response_body_chunk(&self, chunk: Chunk) -> Chunk;
 }
 
 lazy_static! {
-    static ref CLIENT: Client<HttpsConnector<HttpConnector>, MitmBody> =
-        client::Builder::default().build(HttpsConnector::new(4));
+    static ref CLIENT: Client<HttpsConnector<HttpConnector>, Body> =
+        Client::builder().build(HttpsConnector::new(4));
     static ref HTTP: Http = Http::new();
-    static ref TLS_CONFIG_CACHE: Mutex<LruCache<String, Arc<rustls::ServerConfig>>> = Mutex::new(LruCache::new(1000));
 }
 
-pub fn gen_key_cert(authority: &Authority) -> (rustls::PrivateKey, rustls::Certificate) {
-    info!("gen_key_cert() generating key/cert for {}", authority.host());
-
-    let rsa: Rsa<openssl::pkey::Private> = Rsa::generate(2048).unwrap();
-    let pkey = PKey::from_rsa(rsa.clone()).unwrap();
-    let key = rustls::PrivateKey(rsa.private_key_to_der().unwrap());
-
-    let mut x509_name = X509NameBuilder::new().unwrap();
-    x509_name.append_entry_by_text("CN", authority.host()).unwrap();
-    let x509_name = x509_name.build();
-
-    let mut x509builder = X509Builder::new().unwrap();
-    x509builder.set_pubkey(&pkey).unwrap();
-    x509builder.set_version(2).unwrap();
-    x509builder.set_subject_name(&x509_name).unwrap();
-    x509builder.set_issuer_name(&x509_name).unwrap();
-    x509builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
-    x509builder.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
-    x509builder.sign(&pkey, MessageDigest::sha256()).unwrap();
-    let x509 = x509builder.build();
-
-    let cert = rustls::Certificate(x509.to_der().unwrap());
-
-    (key, cert)
+pub struct MitmProxyService<T: Mitm + Sync> {
+    _phantom: std::marker::PhantomData<T>,
 }
 
-pub fn tls_config(authority: &Authority) -> Arc<rustls::ServerConfig> {
-    if !TLS_CONFIG_CACHE.lock().unwrap().contains_key(authority.host()) {
-        let tls_cfg: Arc<rustls::ServerConfig> = {
-            let (key, cert) = gen_key_cert(&authority);
-            let certs = vec![cert; 1];
-            let mut result = rustls::ServerConfig::new(rustls::NoClientAuth::new());
-            result.set_single_cert(certs, key)
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("{}", e))
-                }).unwrap();
-            Arc::new(result)
-        };
+impl<T: Mitm + Sync + Send + 'static> Service for MitmProxyService<T> {
+    type ReqBody = Body;
+    type ResBody = Body;
+    type Error = std::io::Error;
+    type Future =
+        Box<dyn Future<Item = Response<Body>, Error = std::io::Error> + Send>;
 
-        TLS_CONFIG_CACHE.lock().unwrap().insert(authority.host().to_owned(), tls_cfg);
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        info!("MitmProxyService::call() handling {:?}", req);
+        if *req.method() == Method::CONNECT {
+            Box::new(proxy_connect_https_request::<T>(req))
+        } else {
+            Box::new(proxy_http_request::<T>(req))
+        }
     }
+}
 
-    TLS_CONFIG_CACHE.lock().unwrap().get_mut(authority.host()).unwrap().clone()
+impl<T: Mitm + Sync> MitmProxyService<T> {
+    pub fn new() -> Self {
+        MitmProxyService::<T> {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Mitm + Sync + Send + 'static> NewService for MitmProxyService<T> {
+    type ReqBody = Body;
+    type ResBody = Body;
+    type Error = std::io::Error;
+    type Service = MitmProxyService<T>;
+    type InitError = std::io::Error;
+    type Future = FutureResult<Self::Service, Self::InitError>;
+
+    fn new_service(&self) -> Self::Future {
+        future::ok(MitmProxyService::new())
+    }
+}
+
+fn proxy_request<T: Mitm + Sync + Send + 'static>(
+    req: Request<Body>,
+    pooled: &mut Pooled<PoolClient<Body>>,
+) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
+    let mitm1 = Arc::new(T::new());
+    let mitm2 = Arc::clone(&mitm1);
+
+    let req = mitm1.request_headers(req);
+    let (parts, body) = req.into_parts();
+    let body = Body::wrap_stream(
+        body.map(move |chunk| mitm1.request_body_chunk(chunk)),
+    );
+    let req = Request::from_parts(parts, body);
+
+    info!("proxy_request() sending request {:?}", req);
+    pooled
+        .send_request_retryable(req)
+        .map(|response| {
+            let response = mitm2.response_headers(response);
+            let (parts, body) = response.into_parts();
+            let body = Body::wrap_stream(
+                body.map(move |chunk| mitm2.response_body_chunk(chunk)),
+            );
+            Response::from_parts(parts, body)
+        })
+        .map_err(|(e, _)| e)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+fn proxy_http_request<T: Mitm + Sync + Send + 'static>(
+    mut req: Request<Body>,
+) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
+    let uri_parts = req.uri_mut().clone().into_parts();
+
+    let fut = pooled_connection(
+        uri_parts.scheme.clone().unwrap(),
+        uri_parts.authority.clone().unwrap(),
+    )
+    .map_err(|e| {
+        info!(
+            "proxy_http_request() returning 502 (error obtaining connection \
+             to {}://{}: {:?})",
+            uri_parts.scheme.unwrap(),
+            uri_parts.authority.unwrap(),
+            e
+        );
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "error obtaining connection",
+        )
+    })
+    .map(|mut pooled| proxy_request::<T>(req, &mut pooled))
+    .and_then(|res| res)
+    .or_else(|_| {
+        future::ok(Response::builder().status(502).body(Body::empty()).unwrap())
+    });
+
+    fut
+}
+
+fn connect_responder_mpsc() -> (
+    mpsc::Sender<Result<(), hyper::client::ClientError<hyper::Body>>>,
+    impl Future<Item = Response<Body>, Error = std::io::Error>,
+) {
+    let (sender, receiver) =
+        mpsc::channel::<Result<(), hyper::client::ClientError<Body>>>(0);
+    let response_future = receiver
+        .take(1)
+        .into_future()
+        .map(|(opt_res, _)| {
+            opt_res.map_or_else(
+                || {
+                    info!(
+                        "connect_responder_mpsc() returning 502 (mpsc \
+                         received no message)"
+                    );
+                    Response::builder().status(502).body(Body::empty()).unwrap()
+                },
+                |res| match res {
+                    Ok(_) => {
+                        info!(
+                            "connect_responder_mpsc() returning 200 \
+                             (mpsc received ok message)"
+                        );
+                        Response::builder()
+                            .status(200)
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                    Err(e) => {
+                        info!(
+                            "connect_responder_mpsc() returning 502 \
+                             (mpsc received error message: {:?})",
+                            e
+                        );
+                        Response::builder()
+                            .status(502)
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                },
+            )
+        })
+        .map_err(|e| {
+            let msg = format!("connect_responder_mpsc() error: {:?}", e);
+            error!("{}", msg);
+            std::io::Error::new(std::io::ErrorKind::Other, msg)
+        });
+
+    (sender, response_future)
+}
+
+fn pooled_connection<S: Display + Clone, A: Display + Clone>(
+    scheme: S,
+    authority: A,
+) -> impl Future<Item = Pooled<PoolClient<Body>>, Error = ClientError<Body>>
+where
+    Scheme: http::HttpTryFrom<S>,
+    Authority: http::HttpTryFrom<A>,
+{
+    let pool_key = Arc::new(
+        format!("{}://{}", scheme.clone(), authority.clone()).to_string(),
+    );
+    let uri = http::uri::Builder::new()
+        .scheme(scheme)
+        .authority(authority)
+        .path_and_query("/")
+        .build()
+        .unwrap();
+    info!(
+        "pooled_connection() obtaining connection for uri={} pool_key={}",
+        uri, pool_key
+    );
+    let result = CLIENT.connection_for(uri, pool_key);
+    result
+}
+
+fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
+    in_req: Request<Body>,
+) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
+    let (sender, result) = connect_responder_mpsc();
+
+    let authority =
+        Authority::from_shared(Bytes::from(in_req.uri().to_string())).unwrap();
+    info!(
+        "proxy_connect_https_request() impersonating {:?}",
+        authority
+    );
+    let tls_cfg = certauth::tls_config(&authority);
+
+    let conn_fut = pooled_connection("https", authority.clone())
+        .then(|result| {
+            let (msg, result) = match result {
+                Ok(pooled) => (Ok(()), Ok(pooled)),
+                Err(e) => (Err(e), Err(())),
+            };
+
+            let send = sender.send(msg)
+                .map(|_| ()) // normal, nothing to see here
+                .map_err(|e| {
+                    panic!("proxy_connect_https_request() mpsc sender.send() \
+                            errored: {}", e);
+                });
+            hyper::rt::spawn(send);
+
+            result
+        })
+        .map_err(|_| ()) // error handled and logged at other end of mpsc
+        .map(move |mut pooled| {
+            let inner = in_req.into_body().on_upgrade().map_err(|e| {
+                info!("proxy_connect_https_request() \
+                       on_upgrade error: {:?}", e);
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })
+            .and_then(|upgraded: Upgraded| -> Accept<Upgraded> {
+                TlsAcceptor::from(tls_cfg).accept(upgraded)
+            })
+            .map(move |stream: TlsStream<Upgraded, rustls::ServerSession>| {
+                info!("proxy_connect_https_request()  tls connection \
+                       established with proxy client: {:?}", stream);
+                let svc = service_fn(move |req: Request<Body>| {
+                    proxy_request::<T>(req, &mut pooled)
+                });
+
+                let conn = HTTP
+                    .serve_connection(stream, svc)
+                    .map_err(|e: hyper::Error| {
+                        if match e.source() {
+                            Some(source) => {
+                                source.to_string()
+                                    .find("Connection reset by peer").is_some()
+                            },
+                            None => false,
+                        } {
+                            info!("proxy_connect_https_request() \
+                                   serve_connection: client closed connection");
+                        } else {
+                            error!("proxy_connect_https_request() \
+                                    serve_connection: {}", e);
+                        };
+                    });
+
+                conn
+            })
+            .map_err(|e: std::io::Error| {
+                error!("proxy_connect_https_request() error from somewhere: {}", e);
+            })
+            .and_then(|conn| conn);
+
+            hyper::rt::spawn(inner);
+    });
+    hyper::rt::spawn(conn_fut);
+
+    result
 }

@@ -1,24 +1,22 @@
 [package]
-name = "mitmprox"
+name = "monie"
 version = "0.1.0"
 authors = ["Noah Levitt <nlevitt@archive.org>"]
+edition = "2018"
 
 [dependencies]
-hyper = "0.12.16"
-futures = "0.1.25"
-http = "0.1.13"
-log = "0.4.5"
-env_logger = "0.5.13"
+hyper = "0.12.29"
 hyper-rustls = "0.15.0"
-rustls = "0.14"
-tokio-rustls = "0.8.0"
-tokio = "0.1.11"
+http = "0.1.14"
 lazy_static = "1.2.0"
-bytes = "0.4"
+rustls = "0.14.0"
+lru-cache = "0.1.1"
+tokio-rustls = "0.8.0"
 openssl = "0.10"
-lru-cache = "0.1"
+bytes = "0.4.4"
+futures = "0.1.25"
+log = "0.4.5"
 
-# [replace]
-# "hyper:0.12.18" = { path = '../hyper' }
-# "hyper-rustls:0.15.0" = { path = '../hyper-rustls' }
-# "tokio-rustls:0.8.0" = { path = '../tokio-rustls' }
+[patch.crates-io]
+"hyper" = { git = "https://github.com/nlevitt/hyper", branch = "pub-pool" }
+
