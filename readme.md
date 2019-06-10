@@ -1,6 +1,6 @@
-# mitmprox
-man-in-the-middle http/https proxy library in rust
+# monie
+mitm http/https proxy library in rust
 
-Still at the proof-of-concept / I'm-learning-rust stage of development. It does work for me though. Comes with a sample app.
+Should be fast. Asynchronous. Uses https://github.com/hyperium/hyper.
 
-Should be fast. Asynchronous, built using https://github.com/hyperium/hyper.
+<img src="https://img.discogs.com/QphGS1igloXHNKiBiPe8936I1hI=/fit-in/600x535/filters:strip_icc():format(jpeg):mode_rgb():quality(90)/discogs-images/R-244973-1219689437.jpeg.jpg" alt="monie in the middle" width="279" height="249">
