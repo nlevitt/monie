@@ -17,7 +17,7 @@ use futures::stream::Stream;
 use futures::sync::mpsc;
 use futures::Sink;
 use http::method::Method;
-use http::uri::{Authority, Scheme};
+use http::uri::{Authority, Scheme, Uri};
 use hyper::client::pool::Pooled;
 use hyper::client::{ClientError, HttpConnector, PoolClient};
 use hyper::server::conn::Http;
@@ -28,7 +28,7 @@ use hyper_rustls::HttpsConnector;
 use tokio_rustls::{Accept, TlsAcceptor, TlsStream};
 
 pub trait Mitm {
-    fn new() -> Self;
+    fn new(uri: Uri) -> Self;
     fn request_headers(&self, req: Request<Body>) -> Request<Body>;
     fn request_body_chunk(&self, chunk: Chunk) -> Chunk;
     fn response_headers(&self, res: Response<Body>) -> Response<Body>;
@@ -84,10 +84,11 @@ impl<T: Mitm + Sync + Send + 'static> NewService for MitmProxyService<T> {
 }
 
 fn proxy_request<T: Mitm + Sync + Send + 'static>(
+    mitm: T,
     req: Request<Body>,
     pooled: &mut Pooled<PoolClient<Body>>,
 ) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
-    let mitm1 = Arc::new(T::new());
+    let mitm1 = Arc::new(mitm);
     let mitm2 = Arc::clone(&mitm1);
 
     let req = mitm1.request_headers(req);
@@ -108,13 +109,18 @@ fn proxy_request<T: Mitm + Sync + Send + 'static>(
             );
             Response::from_parts(parts, body)
         })
-        .map_err(|(e, _)| e)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(|(e, _f)| {
+            info!("e={}", e);
+            info!("_f={:?}", _f);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })
 }
 
 fn proxy_http_request<T: Mitm + Sync + Send + 'static>(
     mut req: Request<Body>,
 ) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
+    let mitm = T::new(req.uri().to_owned());
+
     let uri_parts = req.uri_mut().clone().into_parts();
 
     let fut = pooled_connection(
@@ -134,7 +140,7 @@ fn proxy_http_request<T: Mitm + Sync + Send + 'static>(
             "error obtaining connection",
         )
     })
-    .map(|mut pooled| proxy_request::<T>(req, &mut pooled))
+    .map(|mut pooled| proxy_request::<T>(mitm, req, &mut pooled))
     .and_then(|res| res)
     .or_else(|_| {
         future::ok(Response::builder().status(502).body(Body::empty()).unwrap())
@@ -221,19 +227,20 @@ where
 }
 
 fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
-    in_req: Request<Body>,
+    connect_req: Request<Body>,
 ) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
     let (sender, result) = connect_responder_mpsc();
 
     let authority =
-        Authority::from_shared(Bytes::from(in_req.uri().to_string())).unwrap();
+        Authority::from_shared(Bytes::from(connect_req.uri().to_string()))
+            .unwrap();
     info!(
         "proxy_connect_https_request() impersonating {:?}",
         authority
     );
     let tls_cfg = certauth::tls_config(&authority);
 
-    let conn_fut = pooled_connection("https", authority.clone())
+    let conn_fut = pooled_connection("https", authority)
         .then(|result| {
             let (msg, result) = match result {
                 Ok(pooled) => (Ok(()), Ok(pooled)),
@@ -252,7 +259,7 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
         })
         .map_err(|_| ()) // error handled and logged at other end of mpsc
         .map(move |mut pooled| {
-            let inner = in_req.into_body().on_upgrade().map_err(|e| {
+            let inner = connect_req.into_body().on_upgrade().map_err(|e| {
                 info!("proxy_connect_https_request() \
                        on_upgrade error: {:?}", e);
                 std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -261,10 +268,23 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
                 TlsAcceptor::from(tls_cfg).accept(upgraded)
             })
             .map(move |stream: TlsStream<Upgraded, rustls::ServerSession>| {
-                info!("proxy_connect_https_request()  tls connection \
+                info!("proxy_connect_https_request() tls connection \
                        established with proxy client: {:?}", stream);
                 let svc = service_fn(move |req: Request<Body>| {
-                    proxy_request::<T>(req, &mut pooled)
+                    // "host" header is required for http 1.1
+                    // XXX but we could fall back on authority
+                    let authority = req.headers()
+                        .get("host").unwrap()
+                        .to_str().unwrap();
+                    let uri = http::uri::Builder::new()
+                        .scheme("https")
+                        .authority(authority)
+                        .path_and_query(&req.uri().to_string() as &str)
+                        .build()
+                        .unwrap();
+                    let mitm = T::new(uri);
+
+                    proxy_request::<T>(mitm, req, &mut pooled)
                 });
 
                 let conn = HTTP
@@ -273,7 +293,8 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
                         if match e.source() {
                             Some(source) => {
                                 source.to_string()
-                                    .find("Connection reset by peer").is_some()
+                                    .find("Connection reset by peer")
+                                    .is_some()
                             },
                             None => false,
                         } {
@@ -288,7 +309,8 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
                 conn
             })
             .map_err(|e: std::io::Error| {
-                error!("proxy_connect_https_request() error from somewhere: {}", e);
+                error!("proxy_connect_https_request() error from somewhere: \
+                        {}", e);
             })
             .and_then(|conn| conn);
 
