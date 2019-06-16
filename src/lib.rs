@@ -240,26 +240,31 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
     );
     let tls_cfg = certauth::tls_config(&authority);
 
-    let conn_fut = pooled_connection("https", authority)
-        .then(|result| {
-            let (msg, result) = match result {
-                Ok(pooled) => (Ok(()), Ok(pooled)),
-                Err(e) => (Err(e), Err(())),
-            };
+    let conn_fut =
+        pooled_connection("https", authority)
+            .then(|result| {
+                let (msg, result) = match result {
+                    Ok(pooled) => (Ok(()), Ok(pooled)),
+                    Err(e) => (Err(e), Err(())),
+                };
 
-            let send = sender.send(msg)
-                .map(|_| ()) // normal, nothing to see here
-                .map_err(|e| {
-                    panic!("proxy_connect_https_request() mpsc sender.send() \
-                            errored: {}", e);
-                });
-            hyper::rt::spawn(send);
+                let send = sender
+                    .send(msg)
+                    .map(|_| ()) // normal, nothing to see here
+                    .map_err(|e| {
+                        panic!(
+                            "proxy_connect_https_request() mpsc sender.send() \
+                             errored: {}",
+                            e
+                        );
+                    });
+                hyper::rt::spawn(send);
 
-            result
-        })
-        .map_err(|_| ()) // error handled and logged at other end of mpsc
-        .map(move |mut pooled| {
-            let inner = connect_req.into_body().on_upgrade().map_err(|e| {
+                result
+            })
+            .map_err(|_| ()) // error handled and logged at other end of mpsc
+            .map(move |_pooled| {
+                let inner = connect_req.into_body().on_upgrade().map_err(|e| {
                 info!("proxy_connect_https_request() \
                        on_upgrade error: {:?}", e);
                 std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -282,9 +287,12 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
                         .path_and_query(&req.uri().to_string() as &str)
                         .build()
                         .unwrap();
-                    let mitm = T::new(uri);
 
-                    proxy_request::<T>(mitm, req, &mut pooled)
+                    let (mut parts, body) = req.into_parts();
+                    parts.uri = uri;
+                    let req = Request::from_parts(parts, body);
+
+                    proxy_http_request::<T>(req)
                 });
 
                 let conn = HTTP
@@ -314,8 +322,8 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
             })
             .and_then(|conn| conn);
 
-            hyper::rt::spawn(inner);
-    });
+                hyper::rt::spawn(inner);
+            });
     hyper::rt::spawn(conn_fut);
 
     result
