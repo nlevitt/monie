@@ -14,8 +14,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::{self, Future, FutureResult};
 use futures::stream::Stream;
-use futures::sync::mpsc;
-use futures::Sink;
 use http::method::Method;
 use http::uri::{Authority, Scheme, Uri};
 use hyper::client::pool::Pooled;
@@ -149,58 +147,6 @@ fn proxy_http_request<T: Mitm + Sync + Send + 'static>(
     fut
 }
 
-fn connect_responder_mpsc() -> (
-    mpsc::Sender<Result<(), hyper::client::ClientError<hyper::Body>>>,
-    impl Future<Item = Response<Body>, Error = std::io::Error>,
-) {
-    let (sender, receiver) =
-        mpsc::channel::<Result<(), hyper::client::ClientError<Body>>>(0);
-    let response_future = receiver
-        .take(1)
-        .into_future()
-        .map(|(opt_res, _)| {
-            opt_res.map_or_else(
-                || {
-                    info!(
-                        "connect_responder_mpsc() returning 502 (mpsc \
-                         received no message)"
-                    );
-                    Response::builder().status(502).body(Body::empty()).unwrap()
-                },
-                |res| match res {
-                    Ok(_) => {
-                        info!(
-                            "connect_responder_mpsc() returning 200 \
-                             (mpsc received ok message)"
-                        );
-                        Response::builder()
-                            .status(200)
-                            .body(Body::empty())
-                            .unwrap()
-                    }
-                    Err(e) => {
-                        info!(
-                            "connect_responder_mpsc() returning 502 \
-                             (mpsc received error message: {:?})",
-                            e
-                        );
-                        Response::builder()
-                            .status(502)
-                            .body(Body::empty())
-                            .unwrap()
-                    }
-                },
-            )
-        })
-        .map_err(|e| {
-            let msg = format!("connect_responder_mpsc() error: {:?}", e);
-            error!("{}", msg);
-            std::io::Error::new(std::io::ErrorKind::Other, msg)
-        });
-
-    (sender, response_future)
-}
-
 fn pooled_connection<S: Display + Clone, A: Display + Clone>(
     scheme: S,
     authority: A,
@@ -229,8 +175,6 @@ where
 fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
     connect_req: Request<Body>,
 ) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
-    let (sender, result) = connect_responder_mpsc();
-
     let authority =
         Authority::from_shared(Bytes::from(connect_req.uri().to_string()))
             .unwrap();
@@ -240,31 +184,9 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
     );
     let tls_cfg = certauth::tls_config(&authority);
 
-    let conn_fut =
-        pooled_connection("https", authority)
-            .then(|result| {
-                let (msg, result) = match result {
-                    Ok(pooled) => (Ok(()), Ok(pooled)),
-                    Err(e) => (Err(e), Err(())),
-                };
-
-                let send = sender
-                    .send(msg)
-                    .map(|_| ()) // normal, nothing to see here
-                    .map_err(|e| {
-                        panic!(
-                            "proxy_connect_https_request() mpsc sender.send() \
-                             errored: {}",
-                            e
-                        );
-                    });
-                hyper::rt::spawn(send);
-
-                result
-            })
-            .map_err(|_| ()) // error handled and logged at other end of mpsc
-            .map(move |_pooled| {
-                let inner = connect_req.into_body().on_upgrade().map_err(|e| {
+    pooled_connection("https", authority)
+        .map(move |_pooled| {
+            let inner = connect_req.into_body().on_upgrade().map_err(|e| {
                 info!("proxy_connect_https_request() \
                        on_upgrade error: {:?}", e);
                 std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -304,7 +226,7 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
                                     .find("Connection reset by peer")
                                     .is_some()
                             },
-                            None => false,
+                                None => false,
                         } {
                             info!("proxy_connect_https_request() \
                                    serve_connection: client closed connection");
@@ -322,9 +244,12 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
             })
             .and_then(|conn| conn);
 
-                hyper::rt::spawn(inner);
-            });
-    hyper::rt::spawn(conn_fut);
+            hyper::rt::spawn(inner);
 
-    result
+            Response::builder().status(200).body(Body::empty()).unwrap()
+        })
+        .or_else(|e| {
+            info!("proxy_connect_https_request() returning 502, failed to connect: {:?}", e);
+            future::ok(Response::builder().status(502).body(Body::empty()).unwrap())
+        })
 }
