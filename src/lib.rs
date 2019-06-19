@@ -187,7 +187,7 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
     pooled_connection("https", authority)
         .map(move |_pooled| {
             let inner = connect_req.into_body().on_upgrade().map_err(|e| {
-                info!("proxy_connect_https_request() \
+                info!("proxy_connect_https_request() 
                        on_upgrade error: {:?}", e);
                 std::io::Error::new(std::io::ErrorKind::Other, e)
             })
@@ -197,52 +197,13 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
             .map(move |stream: TlsStream<Upgraded, rustls::ServerSession>| {
                 info!("proxy_connect_https_request() tls connection \
                        established with proxy client: {:?}", stream);
-                let svc = service_fn(move |req: Request<Body>| {
-                    // "host" header is required for http 1.1
-                    // XXX but we could fall back on authority
-                    let authority = req.headers()
-                        .get("host").unwrap()
-                        .to_str().unwrap();
-                    let uri = http::uri::Builder::new()
-                        .scheme("https")
-                        .authority(authority)
-                        .path_and_query(&req.uri().to_string() as &str)
-                        .build()
-                        .unwrap();
-
-                    let (mut parts, body) = req.into_parts();
-                    parts.uri = uri;
-                    let req = Request::from_parts(parts, body);
-
-                    proxy_http_request::<T>(req)
-                });
-
-                let conn = HTTP
-                    .serve_connection(stream, svc)
-                    .map_err(|e: hyper::Error| {
-                        if match e.source() {
-                            Some(source) => {
-                                source.to_string()
-                                    .find("Connection reset by peer")
-                                    .is_some()
-                            },
-                                None => false,
-                        } {
-                            info!("proxy_connect_https_request() \
-                                   serve_connection: client closed connection");
-                        } else {
-                            error!("proxy_connect_https_request() \
-                                    serve_connection: {}", e);
-                        };
-                    });
-
-                conn
+                service_inner_requests::<T>(stream)
             })
             .map_err(|e: std::io::Error| {
                 error!("proxy_connect_https_request() error from somewhere: \
                         {}", e);
             })
-            .and_then(|conn| conn);
+            .flatten();
 
             hyper::rt::spawn(inner);
 
@@ -252,4 +213,48 @@ fn proxy_connect_https_request<T: Mitm + Sync + Send + 'static>(
             info!("proxy_connect_https_request() returning 502, failed to connect: {:?}", e);
             future::ok(Response::builder().status(502).body(Body::empty()).unwrap())
         })
+}
+
+fn service_inner_requests<T: Mitm + Sync + Send + 'static>(
+    stream: TlsStream<Upgraded, rustls::ServerSession>
+) -> impl Future<Item = (), Error = ()> {
+    let svc = service_fn(move |req: Request<Body>| {
+        // "host" header is required for http 1.1
+        // XXX but we could fall back on authority
+        let authority = req.headers()
+            .get("host").unwrap()
+            .to_str().unwrap();
+        let uri = http::uri::Builder::new()
+            .scheme("https")
+            .authority(authority)
+            .path_and_query(&req.uri().to_string() as &str)
+            .build()
+            .unwrap();
+
+        let (mut parts, body) = req.into_parts();
+        parts.uri = uri;
+        let req = Request::from_parts(parts, body);
+
+        proxy_http_request::<T>(req)
+    });
+
+    let conn = HTTP
+        .serve_connection(stream, svc)
+        .map_err(|e: hyper::Error| {
+            if match e.source() {
+                Some(source) => {
+                    source.to_string()
+                        .find("Connection reset by peer")
+                        .is_some()
+                },
+                None => false,
+            } {
+                info!("service_inner_requests() serve_connection: \
+                       client closed connection");
+            } else {
+                error!("service_inner_requests() serve_connection: {}", e);
+            };
+        });
+
+    conn
 }
