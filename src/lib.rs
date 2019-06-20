@@ -1,7 +1,37 @@
 //! Monie-in-the-middle http(s) proxy library
 //!
-//! Observe and manipulate requests by implementing `monie::Mitm`. See the
-//! examples at <https://github.com/nlevitt/monie/tree/master/examples>.
+//! Observe and manipulate requests by implementing `monie::Mitm`.
+//!
+//! Here is a skeleton to help get started:
+//!
+//! ```
+//! use futures::future::Future;
+//! use hyper::{Body, Chunk, Request, Response, Server};
+//! use monie::{Mitm, MitmProxyService};
+//!
+//! struct MyMitm;
+//!
+//! impl Mitm for MyMitm {
+//!     fn new(_: http::uri::Uri) -> MyMitm { MyMitm {} }
+//!     fn request_headers(&self, req: Request<Body>) -> Request<Body> { req }
+//!     fn response_headers(&self, res: Response<Body>) -> Response<Body> { res }
+//!     fn request_body_chunk(&self, chunk: Chunk) -> Chunk { chunk }
+//!     fn response_body_chunk(&self, chunk: Chunk) -> Chunk { chunk }
+//! }
+//!
+//! fn main() {
+//!     let addr = ([127, 0, 0, 1], 8000).into();
+//!     let svc = MitmProxyService::<MyMitm>::new();
+//!     let server = Server::bind(&addr)
+//!         .serve(svc)
+//!         .map_err(|e| eprintln!("server error: {}", e));
+//!     println!("noop mitm proxy listening on http://{}", addr);
+//!     hyper::rt::run(server);
+//! }
+//! ```
+//!
+//! Other examples can be found at
+//! <https://github.com/nlevitt/monie/tree/master/examples>.
 
 #![deny(warnings)]
 #![deny(missing_docs)]
