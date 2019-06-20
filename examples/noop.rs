@@ -3,6 +3,7 @@
 #![deny(warnings)]
 
 use futures::future::Future;
+use http::uri::Uri;
 use hyper::{Body, Chunk, Request, Response, Server};
 
 use monie::{Mitm, MitmProxyService};
@@ -11,7 +12,10 @@ use monie::{Mitm, MitmProxyService};
 struct NoopMitm;
 
 impl Mitm for NoopMitm {
-    fn new(_: http::uri::Uri) -> NoopMitm { NoopMitm {} }
+    fn new(uri: Uri) -> NoopMitm {
+        println!("proxying request for {}", uri);
+        NoopMitm {}
+    }
     fn request_headers(&self, req: Request<Body>) -> Request<Body> { req }
     fn response_headers(&self, res: Response<Body>) -> Response<Body> { res }
     fn request_body_chunk(&self, chunk: Chunk) -> Chunk { chunk }
