@@ -1,4 +1,11 @@
+//! Monie-in-the-middle http(s) proxy library
+//!
+//! Observe and manipulate requests by implementing `monie::Mitm`. See the
+//! examples at <https://github.com/nlevitt/monie/tree/master/examples>.
+
 #![deny(warnings)]
+#![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
 
 #[macro_use]
 extern crate lazy_static;
@@ -24,11 +31,40 @@ use hyper::{Body, Chunk, Client, Request, Response};
 use hyper_rustls::HttpsConnector;
 use tokio_rustls::{Accept, TlsAcceptor, TlsStream};
 
+/// Represents the interception of a single request. Users of the library must
+/// implement this trait. With it you can observe and manipulate the request
+/// and response payload and headers.
 pub trait Mitm {
+    /// Create a new instance of this `Mitm` implementation. The argument `uri`
+    /// is the uri being proxied. Implementations may do with this what they
+    /// wish (log it, stash it, ignore it, etc).
     fn new(uri: Uri) -> Self;
+
+    /// Observe and manipulate the request headers. The `req` argument contains
+    /// the original request headers received from the proxy client. The
+    /// request headers returned by this function are sent to the remote
+    /// server.
     fn request_headers(&self, req: Request<Body>) -> Request<Body>;
+
+    /// Observe and manipulate a chunk of the request payload. This function
+    /// may be called zero or more times, depending on the size of the request
+    /// payload. It will not be called at all in the common case of a GET
+    /// request with no payload. The `chunk` argument contains an original
+    /// chunk of the request payload as received from the proxy client. The
+    /// return value of this function is sent to the remote server.
     fn request_body_chunk(&self, chunk: Chunk) -> Chunk;
+
+    /// Observe and manipulate the response headers. The `res` argument
+    /// contains the original response headers received from the remote server.
+    /// The response headers returned by this function are sent to the proxy
+    /// client.
     fn response_headers(&self, res: Response<Body>) -> Response<Body>;
+
+    /// Observe and manipulate a chunk of the response payload. This function
+    /// may be called zero or more times, depending on the size of the payload.
+    /// The `chunk` argument represents an unaltered chunk of the response
+    /// payload as received from the remote server. The return value of this
+    /// function is sent to the remote server.
     fn response_body_chunk(&self, chunk: Chunk) -> Chunk;
 }
 
@@ -38,28 +74,16 @@ lazy_static! {
     static ref HTTP: Http = Http::new();
 }
 
+/// The `hyper::service::Service` that does the proxying and calls your `Mitm`
+/// implementation.
+#[derive(Debug)]
 pub struct MitmProxyService<T: Mitm + Sync> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: Mitm + Sync + Send + 'static> Service for MitmProxyService<T> {
-    type ReqBody = Body;
-    type ResBody = Body;
-    type Error = std::io::Error;
-    type Future =
-        Box<dyn Future<Item = Response<Body>, Error = std::io::Error> + Send>;
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        info!("MitmProxyService::call() handling {:?}", req);
-        if *req.method() == Method::CONNECT {
-            Box::new(proxy_connect::<T>(req))
-        } else {
-            Box::new(proxy_request::<T>(req))
-        }
-    }
-}
-
 impl<T: Mitm + Sync> MitmProxyService<T> {
+    /// Creates a new `MitmProxyService`.
+    #[inline]
     pub fn new() -> Self {
         MitmProxyService::<T> {
             _phantom: std::marker::PhantomData,
@@ -80,6 +104,25 @@ impl<T: Mitm + Sync + Send + 'static> NewService for MitmProxyService<T> {
     }
 }
 
+impl<T: Mitm + Sync + Send + 'static> Service for MitmProxyService<T> {
+    type ReqBody = Body;
+    type ResBody = Body;
+    type Error = std::io::Error;
+    type Future =
+        Box<dyn Future<Item = Response<Body>, Error = std::io::Error> + Send>;
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        info!("MitmProxyService::call() handling {:?}", req);
+        if *req.method() == Method::CONNECT {
+            Box::new(proxy_connect::<T>(req))
+        } else {
+            Box::new(proxy_request::<T>(req))
+        }
+    }
+}
+
+/// Obtains a connection to the scheme://authority of `uri` from the connection
+/// pool.
 fn obtain_connection(
     uri: Uri,
 ) -> impl Future<Item = Pooled<PoolClient<Body>>, Error = std::io::Error> {
@@ -100,6 +143,12 @@ fn obtain_connection(
     result
 }
 
+/// Obtains a connection to the remote server and proxies the request, calling
+/// the `Mitm` implementation functions, which may manipulate the request and
+/// reponse. Returns a future that resolves to the response or error.
+///
+/// This function is called for plain http requests, and for https requests
+/// received "inside" the fake, tapped `CONNECT` tunnel.
 fn proxy_request<T: Mitm + Sync + Send + 'static>(
     req: Request<Body>,
 ) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
@@ -140,6 +189,10 @@ fn proxy_request<T: Mitm + Sync + Send + 'static>(
         })
 }
 
+/// Handles a CONNECT request. Tries to obtain an https connection to the
+/// remote server. If that fails, returns 502 Bad Gateway. Otherwise returns
+/// 200 OK, then attempts to establish a TLS connection with the proxy client,
+/// masquerading as the remote server.
 fn proxy_connect<T: Mitm + Sync + Send + 'static>(
     connect_req: Request<Body>,
 ) -> impl Future<Item = Response<Body>, Error = std::io::Error> {
@@ -187,6 +240,8 @@ fn proxy_connect<T: Mitm + Sync + Send + 'static>(
         })
 }
 
+/// Called by `proxy_connect()` once the TLS session has been established with
+/// the proxy client. Proxies requests received on the TLS connection.
 fn service_inner_requests<T: Mitm + Sync + Send + 'static>(
     stream: TlsStream<Upgraded, rustls::ServerSession>,
 ) -> impl Future<Item = (), Error = ()> {
@@ -208,8 +263,7 @@ fn service_inner_requests<T: Mitm + Sync + Send + 'static>(
         proxy_request::<T>(req)
     });
 
-    let conn = HTTP
-        .serve_connection(stream, svc)
+    HTTP.serve_connection(stream, svc)
         .map_err(|e: hyper::Error| {
             if match e.source() {
                 Some(source) => source
@@ -225,7 +279,5 @@ fn service_inner_requests<T: Mitm + Sync + Send + 'static>(
             } else {
                 error!("service_inner_requests() serve_connection: {}", e);
             };
-        });
-
-    conn
+        })
 }

@@ -1,4 +1,11 @@
+//! Generates RSA private keys and self-signed X509 certificates.
+//!
+//! Builds `rustls::ServerConfig`s using generated keys and certs, caching the
+//! 1000 most recently used.
+
 #![deny(warnings)]
+#![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
 
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +22,8 @@ lazy_static! {
         Mutex::new(LruCache::new(1000));
 }
 
-fn gen_key_cert(
+/// Generate a key and self-signed cert for the provided authority.
+pub fn gen_key_cert(
     authority: &Authority,
 ) -> (rustls::PrivateKey, rustls::Certificate) {
     info!(
@@ -23,6 +31,7 @@ fn gen_key_cert(
         authority.host()
     );
 
+    // optimization todo: use a single private key
     let rsa: Rsa<openssl::pkey::Private> = Rsa::generate(2048).unwrap();
     let pkey = PKey::from_rsa(rsa.clone()).unwrap();
     let key = rustls::PrivateKey(rsa.private_key_to_der().unwrap());
@@ -52,6 +61,8 @@ fn gen_key_cert(
     (key, cert)
 }
 
+/// Either load an existing TLS server configuration from cache or build a new
+/// one (and cache it) for the provided authority.
 pub fn tls_config(authority: &Authority) -> Arc<rustls::ServerConfig> {
     if !TLS_CONFIG_CACHE
         .lock()
