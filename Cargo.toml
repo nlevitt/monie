@@ -5,20 +5,20 @@ authors = ["Noah Levitt <nlevitt@archive.org>"]
 edition = "2018"
 
 [dependencies]
-hyper = "0.12.29"
-hyper-rustls = "0.15.0"
-http = "0.1.14"
-lazy_static = "1.2.0"
-rustls = "0.14.0"
-lru-cache = "0.1.1"
-tokio-rustls = "0.8.0"
+hyper = "0.12"
+hyper-rustls = "0.15"
+http = "0.1"
+lazy_static = "1.2"
+rustls = "0.14"
+lru-cache = "0.1"
+tokio-rustls = "0.8"
 openssl = "0.10"
-bytes = "0.4.4"
-futures = "0.1.25"
-log = "0.4.5"
+bytes = "0.4"
+futures = "0.1"
+log = "0.4"
 
 [dev-dependencies]
-pretty_env_logger = "0.3.0"
+pretty_env_logger = "0.3"
 
 [patch.crates-io]
 "hyper" = { git = "https://github.com/nlevitt/hyper", branch = "pub-pool" }
